@@ -1,0 +1,61 @@
+# GD32F4-Fertilizer-Sensor
+
+# Build output
+*.axf
+*.crf
+*.d
+*.Dep
+*.iex
+*.ihex
+*.lf
+*.lnp
+*.o
+*.obj
+*.plg
+*.sct
+*.tra
+*.txt
+*.uvguix.*
+*.uvoptx
+*.uvprojx
+DebugConfig/
+Listings/
+Objects/
+*.map
+*.hex
+*.bin
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.elf
+*.map
+*.lst
+*.swp
+*.bak
+*.backup
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+~*
+
+# Keil specific
+*.uvmpw
+*.bak
+*.lst
+
+# FreeRTOS (optional - uncomment if you want to exclude)
+# FreeRTOS/
+
+# GD32 Library (optional - uncomment if you want to exclude)
+# Core/GD32F4xx_Firmware_Library/

@@ -1,0 +1,805 @@
+#include "mytask.h"
+#include "GPIO.h"
+#include "gd32f4xx_libopt.h"
+
+
+////作业状态
+__IO uint8_t  NodeID=0;  //节点ID
+//__IO bool     Work_State=false; //工作状态标志位，用于外部中断//
+__IO bool     Work_State=true; //工作状态标志位，用于外部中断//
+
+/*种子类型*/
+#if defined   Contorller
+__IO uint8_t  Seed_Type=0;
+#else
+__IO uint8_t  Seed_Type=1;  // 玉米
+//__IO uint8_t  Seed_Type=2;  // 大豆
+//__IO uint8_t  Seed_Type=3;  // 高粱
+#endif
+
+////参数调节
+
+
+PID   PidControl_DA1; 	//(光强调节)
+
+
+////计时相关
+extern TimCnt Dust_while1;       	//灰尘补偿死循环计时
+extern TimCnt Du;       	//堵种死循环计时
+extern TimCnt Que;       	//堵种死循环计时
+extern TimCnt Luo_Err;       	//漏种死循环计时
+extern TimCnt Dust_compensation; 	//灰尘补偿
+extern TimCnt Seed_omissions;   	//漏种
+
+//魔术棒中勾选IRAM2,会导致DMA数组无数据，需要用__attribute__将数组指定存放在mem0
+ADCVoltage GetAD	__attribute__ ((at(0X20000000)));
+
+/*******************
+*任务句柄
+********************/
+//开始任务
+TaskHandle_t StartTask_Handler;
+//测试任务
+#if defined test_mode
+TaskHandle_t TestTask_Handler;
+////播种量计算任务
+//TaskHandle_t Dust_compensation_Task_Handler;
+#else
+//状态监测任务
+TaskHandle_t Condition_monitorHandler;
+//灰尘补偿任务
+TaskHandle_t Dust_compensation_Task_Handler;
+//AD处理任务
+TaskHandle_t AD_Voltage_Task_Handler;
+//小籽粒计数任务
+TaskHandle_t SmallSeed_Task_Handler;
+
+
+//周期定时器,用于数据上报
+//void DataUpload_CAN(TimerHandle_t xTimer);
+//TimerHandle_t 	DataUpload_CAN_Handle;
+#endif
+
+/************************************************
+*函数：硬件初始化
+*说明：无
+*返回：无
+************************************************/
+void Hardware_Init(void)
+{
+    NVIC_Config();
+
+    Timer1_Init();
+    GPIO_Init();
+
+    CAN_HardInit();
+    CanIDFliter();
+//    DMA_Init(GetAD.allAD_Buf,300);
+//    ADC_Init();
+//    DAC_Init();
+//    Exti_init();//外部中断
+    Timer5_init();
+
+
+
+//    PID_Init(&PidControl_DA1,0.27,0.00015,50.0,3500,3500);
+//		Timer3_init();  //PWM
+
+}
+
+/************************************************
+*函数：开始任务
+*说明：创建相关工作任务
+*返回：无
+************************************************/
+void start_task(void *pvParameters)
+{
+    taskENTER_CRITICAL();
+#if defined test_mode
+    //测试任务
+    xTaskCreate((TaskFunction_t )Test_task,
+                (const char*    )"Test_task",
+                (uint16_t       )TEST_STK_SIZE,
+                (void*          )NULL,
+                (UBaseType_t    )TEST_TASK_PRIO,
+                (TaskHandle_t*  )&TestTask_Handler);//任务句柄
+
+//    //任务2：创建灰尘补偿任务
+//    xTaskCreate((TaskFunction_t )Dust_compensation_Task,
+//                (const char*    )"Dust_compensation_Task",
+//                (uint16_t       )TASK2_STK_SIZE,
+//                (void*          )NULL,
+//                (UBaseType_t    )TASK2_TASK_PRIO,
+//                (TaskHandle_t*  )&Dust_compensation_Task_Handler);
+
+#else
+    //任务1：创建状态监测任务
+    xTaskCreate((TaskFunction_t )Condition_monitor,
+                (const char*    )"Condition_monitor",
+                (uint16_t       )TASK1_STK_SIZE,
+                (void*          )NULL,
+                (UBaseType_t    )TASK1_TASK_PRIO,
+                (TaskHandle_t*  )&Condition_monitorHandler);
+    //任务2：创建灰尘补偿任务
+    xTaskCreate((TaskFunction_t )Dust_compensation_Task,
+                (const char*    )"Dust_compensation_Task",
+                (uint16_t       )TASK2_STK_SIZE,
+                (void*          )NULL,
+                (UBaseType_t    )TASK2_TASK_PRIO,
+                (TaskHandle_t*  )&Dust_compensation_Task_Handler);//任务句柄
+
+    //任务3：创建AD处理任务
+//    xTaskCreate((TaskFunction_t )AD_Voltage_Task,
+//                (const char*    )"AD_Voltage_Task",
+//                (uint16_t       )TASK3_STK_SIZE,
+//                (void*          )NULL,
+//                (UBaseType_t    )TASK3_TASK_PRIO,
+//                (TaskHandle_t*  )&AD_Voltage_Task_Handler);
+    //任务4: 小颗粒监测任务
+//    xTaskCreate((TaskFunction_t )SmallSeed_Task,
+//                (const char*    )"SmallSeed_Task",
+//                (uint16_t       )TASK4_STK_SIZE,
+//                (void*          )NULL,
+//                (UBaseType_t    )TASK4_TASK_PRIO,
+//                (TaskHandle_t*  )&SmallSeed_Task_Handler);
+//		vTaskSuspend(SmallSeed_Task_Handler);	//挂起任务4
+
+//    	//创建周期软件定时器-用于CAN周期发送
+//    DataUpload_CAN_Handle=xTimerCreate((const char*		)"DataUpload_CAN",
+// 													(TickType_t			)6,
+// 							            (UBaseType_t		)pdTRUE,
+// 							            (void*				)1,
+// 							            (TimerCallbackFunction_t)DataUpload_CAN);
+// 	xTimerStart(DataUpload_CAN_Handle,0);  //开启定时器，用于CAN数据周期上传
+#endif
+    vTaskDelete(StartTask_Handler);
+    taskEXIT_CRITICAL();
+}
+
+/************************************************
+*函数：智能条播种子状态监测
+*说明：用来计算播种量、种子异常状态。种子信号检测信号一直高为异常，堵种信号一直低为堵种，否则为漏种。
+*返回：无
+************************************************/
+#if defined test_mode
+__IO uint16_t current_value;//当前变量值
+__IO uint16_t last_value;//上一次的变量值
+//__IO uint16_t current_value_one;//当前变量值
+//__IO uint16_t last_value_one;//上一次的变量值
+
+
+
+decSeedAbnormal_t sDecSeedAbnormal =
+{
+    .seedQualified = 5,
+};
+
+void Test_task(void *pvParameters)
+{
+    static uint16_t difference=0;//两次接收到的齿数差
+    int Seeding_Rate=0;//总播种量
+    extern int interrupt_occurred;
+    extern int interrupt_occurred_check;
+    extern int Seed_detection;
+    extern uint8_t one;
+    uint16_t Single_Scalar;        //标定量
+    SeedMES.Work_State=false;
+//    const TickType_t xDelay10ms = pdMS_TO_TICKS( 10UL );
+
+
+    while(1)
+    {
+
+        //----------------一、计算播种量-----------------
+        if((CAN_REC_DATA.Gear_num-last_value)!=0)  //判断齿数
+        {
+
+            Single_Scalar=CAN_REC_DATA.Scalar;
+            if(current_value>last_value)
+            {
+                if(interrupt_occurred)
+                {
+                    /*------------先计算齿数差，再计算播种量差--------------------*/
+                    difference = current_value - last_value; // 计算差值
+                    Seeding_Rate = Single_Scalar * difference;//计算播种量差值
+                    SeedMES.Seeding_Rate += Seeding_Rate; //发送播种量
+                    interrupt_occurred=0;//清除进中断标志位
+                }
+
+                last_value = current_value; // 更新上一次的值为当前值
+
+            }
+            else
+            {
+                if(interrupt_occurred)
+                {
+                    /*------------若溢出情况下--------------------*/
+                    difference = current_value + 65535 - last_value; // 计算差值
+                    Seeding_Rate = Single_Scalar * difference;//计算播种量差值
+                    SeedMES.Seeding_Rate += Seeding_Rate; //发送播种量
+                    interrupt_occurred=0;//清除进中断标志位
+                }
+                last_value = current_value; // 更新上一次的值为当前值
+            }
+        }
+        /*----------------------工作状态判断--------------------------------------*/
+
+
+
+        if (sDecSeedAbnormal.currGear < sDecSeedAbnormal.lastGear)
+        {
+            // overflow 溢出
+
+            if((sDecSeedAbnormal.currGear + 65535 - sDecSeedAbnormal.lastGear) >= 2)
+            {
+                if(sDecSeedAbnormal.seedCnt < sDecSeedAbnormal.seedQualified)
+                {
+                    if(gpio_input_bit_get(GPIOA, GPIO_PIN_0) == RESET) //堵
+                    {
+                        SeedMES.SeedCnt_err = 0x02; // 堵种
+                    }
+                    else //缺
+                    {
+                        SeedMES.SeedCnt_err = 0x01; // 缺种
+                    }
+
+                }
+                else
+                {
+                    SeedMES.SeedCnt_err = 0x00;
+                }
+                sDecSeedAbnormal.seedCnt=0;
+                sDecSeedAbnormal.lastGear = sDecSeedAbnormal.currGear;
+            }
+        }
+        else if(sDecSeedAbnormal.currGear - sDecSeedAbnormal.lastGear >= 2)
+        {
+            if(sDecSeedAbnormal.seedCnt < sDecSeedAbnormal.seedQualified)
+            {
+                if(gpio_input_bit_get(GPIOA, GPIO_PIN_0) == RESET) //堵
+                {
+                    SeedMES.SeedCnt_err = 0x02; // 堵种
+                }
+                else //缺
+                {
+                    SeedMES.SeedCnt_err = 0x01; // 缺种
+                }
+            }
+            else
+            {
+                SeedMES.SeedCnt_err = 0x00;
+            }
+            sDecSeedAbnormal.seedCnt=0;
+            sDecSeedAbnormal.lastGear = sDecSeedAbnormal.currGear;
+        }
+        //-----------------------异常落种次数检测------------------------------------
+        if((CAN_REC_DATA.Car_Speed==0)||(CAN_REC_DATA.seed_Speed==0))
+        {
+            if(interrupt_occurred_check)
+            {
+                SeedMES.Seed_detection = Seed_detection; //发送检测落种次数
+                interrupt_occurred_check=0;//清除进中断标志位
+            }
+
+        }
+        else
+        {
+//			Seed_detection=0;//检测落种次数清0
+//          SeedMES.Seed_detection = 0; //can发送落种次数清0
+        }
+
+
+
+    }
+}
+
+
+/******************************************
+*函数：播种量计算任务
+*说明：计算播种量
+*返回：无
+*******************************************/
+//void Dust_compensation_Task(void *pvParameters)
+//{
+//    static uint16_t Save_Gearnum=0; //保存齿数
+//    int Seeding_Rate=0;//总播种量
+//    uint16_t Single_Scalar;        //标定量
+//    extern int interrupt_occurred;
+//    BaseType_t err;
+//    uint32_t NotifyValue;
+//    while(1)
+//    {
+//        err=xTaskNotifyWait((uint32_t	)0x00,
+//                            (uint32_t	)0x01,
+//                            (uint32_t*	)&NotifyValue,
+//                            (TickType_t	)portMAX_DELAY);
+//        if(err==pdPASS)
+//        {
+////            Save_seednum = SeedMES.SeedNum_Cnt;  //保存计数值
+//            taskENTER_CRITICAL();
+//            while(1) {
+//                //----------------一、计算播种量-----------------
+//                if((CAN_REC_DATA.Car_Speed!=0)||((CAN_REC_DATA.Gear_num!=0)&&(Save_Gearnum==0)))
+//                {
+//                    if(CAN_REC_DATA.Gear_num!=0)  //判断齿数
+//                    {
+//                        Save_Gearnum=CAN_REC_DATA.Gear_num;
+//                        Single_Scalar=CAN_REC_DATA.Scalar;
+//                        if(interrupt_occurred)
+//                        {
+//                            // 直接更新Seeding_Rate
+//                            Seeding_Rate += Single_Scalar * Save_Gearnum;
+//                            SeedMES.Seeding_Rate = Seeding_Rate; //发送播种量
+//                            interrupt_occurred=0;//清除进中断标志位
+//                        }
+//                    }
+//                }
+//            }
+//            taskEXIT_CRITICAL();
+//        }
+//    }
+//}
+
+#else
+/******************************************
+*函数：状态监测任务
+*说明：进行相关作业状态检测
+实现堵种、灰尘补偿、缺种、CAN通信相关检测
+*返回：无
+*******************************************/
+void Condition_monitor(void *pvParameters)
+{
+#if defined	Contorller
+    static uint32_t Save_Seednum=0; //保存种子计数值，做漏种判断
+    static uint16_t Save_Gearnum=0; //保存齿数
+    static uint16_t Space_Record=0; //保存株距
+#endif
+
+    while(1)
+    {
+//------读取电压值并做相应处理-------------------------------------------
+
+        GetAD_Filter(&GetAD);
+
+//------电压读取END------------------------------------------------------
+
+        /*--灰尘补偿与堵种状态监测---------------------------------------------*/
+        if((((GetAD.ADC1_Val<=Corn_DustLowAD1)||(GetAD.ADC1_Val>=Corn_DustHigAD1))&&Seed_Type!=3)||
+                (((GetAD.ADC1_Val<=Sorghum_DustLowAD1)||(GetAD.ADC1_Val>=Sorghum_DustHigAD1))&&Seed_Type==3))
+        {
+            Dust_compensation.Flag=true;  //开启定时，延时后再次判断是否需要灰尘补偿
+            if(Dust_compensation.CNT>=1000)
+            {
+                if((((GetAD.ADC1_Val<=Corn_DustLowAD1)||(GetAD.ADC1_Val>=Corn_DustHigAD1))&&Seed_Type!=3)||
+                        (((GetAD.ADC1_Val<=Sorghum_DustLowAD1)||(GetAD.ADC1_Val>=Sorghum_DustHigAD1))&&Seed_Type==3))
+                {
+                    Dust_compensation.CNT=0;
+                    Work_State =false;
+                    dac_data_set(DAC1, DAC_ALIGN_12B_R,0);   //DAC输出数据设置
+                    dac_software_trigger_enable(DAC1);
+                    xTaskNotify((TaskHandle_t	)	Dust_compensation_Task_Handler,//灰尘补偿任务
+                                (uint32_t		)	Dust_compensation_EventB0,
+                                (eNotifyAction	)	eSetBits);
+                }
+
+            }
+        }
+        else
+        {
+            /**********作业种子类型**************/
+#if defined	 Contorller
+
+#if defined CAN_SeedType		  //控制器下发种子类型									
+            if(Space_Record!=Seed_Type)
+            {
+                Space_Record=Seed_Type;
+                switch(Space_Record)
+                {
+                case 1:
+                    da_out.DA2_OUT=Corn_DA2;
+                    gpio_bit_set(GPIOB,GPIO_PIN_1);
+                    break;
+                case 2:
+                    da_out.DA2_OUT=Soybean_DA2;
+                    gpio_bit_set(GPIOB,GPIO_PIN_1);
+                    break;
+                case 3:
+                    da_out.DA2_OUT=Sorghum_DA2;
+                    gpio_bit_reset(GPIOB,GPIO_PIN_1);//放开一半
+#if defined All_Relase
+                    gpio_bit_reset(GPIOC,GPIO_PIN_5);//全放开
+#endif
+                    break;
+
+                default:
+                    da_out.DA2_OUT=Corn_DA2;
+                    gpio_bit_set(GPIOB,GPIO_PIN_1);
+                    break;
+                }
+            }
+#else     //株距判断种子类型
+            if(Space_Record!=CAN_REC_DATA.Spacing)
+            {
+                Space_Record=CAN_REC_DATA.Spacing;
+                if(CAN_REC_DATA.Spacing>=20)							//玉米 株距   >20cm
+                {
+                    Seed_Type=1;
+                    da_out.DA2_OUT=Corn_DA2;
+                    gpio_bit_set(GPIOB,GPIO_PIN_1);
+                }
+                else if((CAN_REC_DATA.Spacing>=10)&&(CAN_REC_DATA.Spacing<20))	  //大豆  株距  10~20cm
+                {
+                    Seed_Type=2;
+                    da_out.DA2_OUT=Soybean_DA2;
+                    gpio_bit_set(GPIOB,GPIO_PIN_1);
+                }
+                else if((CAN_REC_DATA.Spacing>=1)&& (CAN_REC_DATA.Spacing<10))    //高粱	株距  0~10cm
+                {
+                    Seed_Type=3;
+                    da_out.DA2_OUT=Sorghum_DA2;
+                    gpio_bit_reset(GPIOB,GPIO_PIN_1);//放开一半
+#if defined All_Relase
+                    gpio_bit_reset(GPIOC,GPIO_PIN_5);//全放开
+#endif
+                }
+                else //默认玉米
+                {
+                    Seed_Type=1;
+                    da_out.DA2_OUT=Corn_DA2;
+                    gpio_bit_set(GPIOB,GPIO_PIN_1);
+                }
+            }
+#endif
+            dac_data_set(DAC1, DAC_ALIGN_12B_R,da_out.DA2_OUT);   //灵敏度调节  DA2
+            dac_software_trigger_enable(DAC1);
+
+#else
+            /*不带控制器，指定种子类型(调试用)*/
+            switch(Seed_Type)
+            {
+            case 1:
+                gpio_bit_set(GPIOB,GPIO_PIN_1);
+                DA2_OUT=Corn_DA2;
+                break;
+            case 2:
+                gpio_bit_set(GPIOB,GPIO_PIN_1);
+                DA2_OUT=Soybean_DA2;
+                break;
+            case 3:
+                gpio_bit_reset(GPIOB,GPIO_PIN_1);
+                gpio_bit_reset(GPIOC,GPIO_PIN_5);
+                DA2_OUT=Sorghum_DA2;
+                break;
+            default:
+                gpio_bit_set(GPIOB,GPIO_PIN_1);
+                DA2_OUT=Corn_DA2;
+                break;
+            }
+            dac_data_set(DAC1, DAC_ALIGN_12B_R,DA2_OUT);
+            dac_software_trigger_enable(DAC1);
+#endif
+
+            Work_State =true;  //不补偿，就进工作状态
+            SeedMES.SeedCnt_err&=~0x02;//将0x02清零
+            Dust_compensation.CNT=0;
+            Dust_compensation.Flag=false;
+        }
+        /*>>>>>>>>>>>>>>>>>>>>>>灰尘补偿与堵种状态监测-END<<<<<<<<<<<<<<<<<<<<<<<<<<*/
+
+        /*----判断是否作业、种子计数、漏种状态----------------------------*/
+
+        /******************************
+        	**	带控制器  **
+        ******************************/
+#if defined Contorller
+        if(Dust_compensation.Flag==false)   //不进行灰尘补偿才进行判断
+        {
+            if((CAN_REC_DATA.Car_Speed!=0)||((CAN_REC_DATA.Gear_num!=0)&&(Save_Gearnum==0)))  //有车速，有齿数
+            {
+//			        	Work_State =true;	         //进入工作状态
+                if((CAN_REC_DATA.Gear_num!=0)&&(Save_Gearnum==0))
+                {
+                    Save_Gearnum=CAN_REC_DATA.Gear_num;
+                }
+                /*漏种*/
+                if((SeedMES.SeedCnt_err&0x02)==0x02)   //是否堵种（检查 SeedCnt_err 中的特定位（第二位）是否被设置为1。如果是，执行 if 语句块内的代码；如果不是，跳过该块）
+                {
+                    SeedMES.SeedCnt_err&=~0x01;//清除漏种
+                    Save_Gearnum=0;
+                }
+                else
+                {
+                    //漏种灵敏度可调（默认4个齿）
+                    if(((CAN_REC_DATA.Sensitivity*2)!=0)&&
+                            ((abs(CAN_REC_DATA.Gear_num-Save_Gearnum))>=(CAN_REC_DATA.Sensitivity*2)))
+                    {
+                        Save_Gearnum=CAN_REC_DATA.Gear_num;        //记齿数
+                        if(Save_Seednum!=SeedMES.SeedNum_Cnt)      //判断是否落种（保存种子计数值≠种子计数值）
+                        {
+                            Save_Seednum=SeedMES.SeedNum_Cnt;  //记当前落种数
+                            Work_State=true;
+                            SeedMES.SeedCnt_err&=~0x01;//清除漏种
+                        }
+                        else if(Save_Seednum==SeedMES.SeedNum_Cnt)
+                        {
+//													  Save_Gearnum=0;
+                            SeedMES.SeedCnt_err|=0x01;	//漏种
+                            Work_State=false;
+                        }
+                    }
+                    //默认4个齿数
+                    else if((abs(CAN_REC_DATA.Gear_num-Save_Gearnum))>=4)
+                    {
+                        Save_Gearnum=CAN_REC_DATA.Gear_num;
+                        if(Save_Seednum!=SeedMES.SeedNum_Cnt)
+                        {
+                            Save_Seednum=SeedMES.SeedNum_Cnt;
+                            Work_State=true;
+                            SeedMES.SeedCnt_err&=~0x01;//清除漏种
+                        }
+                        else if(Save_Seednum==SeedMES.SeedNum_Cnt)
+                        {
+//													  Save_Gearnum=0;
+                            SeedMES.SeedCnt_err|=0x01;	//漏种
+                            Work_State=false;
+                        }
+                    }
+
+                }
+            }
+            else
+            {
+//                Work_State=false;
+                Save_Gearnum=CAN_REC_DATA.Gear_num;
+            }
+        }
+
+
+
+
+
+
+
+
+
+        /*-------CAN通信故障监测------------------------------------------------------------------------*/
+        if(CanDisWait.Flag)
+        {
+            gpio_bit_reset(GPIOB,GPIO_PIN_4); //红灯
+            gpio_bit_set(GPIOD,GPIO_PIN_2);
+            Save_Gearnum=0;
+            CAN_REC_DATA.Car_Speed=0;
+        }
+#endif
+        /*>>>>>>>>>>>>>>>>>>>>>>判断作业、种子计数、漏种状态----END<<<<<<<<<<<<<<<<<<<<<<<<<<*/
+
+//变异系数计算-------------------------------------------------------------------------
+
+        bianyixishu_count_in_handler();
+
+    }
+}
+
+/******************************************
+*函数：AD电压处理任务
+*说明：进行AD电压读取与数据处理
+*返回：无
+*******************************************/
+//void AD_Voltage_Task(void *pvParameters)
+//{
+//	while(1)
+//	{
+//		taskENTER_CRITICAL();
+//		GetAD_Filter(&GetAD); //AD值处理
+//		taskEXIT_CRITICAL();
+//	}
+//}
+
+/******************************************
+*函数：灰尘补偿任务
+*说明：调节DA1实现光强度调节，实现灰尘补偿
+*返回：无
+*******************************************/
+void Dust_compensation_Task(void *pvParameters)
+{
+    static	uint32_t Save_seednum=0;
+    uint32_t NotifyValue;
+    BaseType_t err;
+    while(1)
+    {
+        err=xTaskNotifyWait((uint32_t	)0x00,
+                            (uint32_t	)0x01,
+                            (uint32_t*	)&NotifyValue,
+                            (TickType_t	)portMAX_DELAY);
+        if(err==pdPASS)
+        {
+            Save_seednum = SeedMES.SeedNum_Cnt;  //保存计数值
+            timer_deinit(TIMER2);//复位外设TIMER2
+
+            Dust_while1.Flag=true;
+
+
+#if defined Contorller
+#else
+            Variation_Gain++;	/*（调试用，无实际意义）调光次数，后期用作变异系数*/
+#endif
+
+            taskENTER_CRITICAL();
+            while(1)
+            {
+                /********************************************************************/
+                switch(Seed_Type)
+                {
+                case 1:
+                    PID_Calc(&PidControl_DA1,Corn_AD1,GetAD.allAD_Buf[148]);
+                    break;
+                case 2:
+                    PID_Calc(&PidControl_DA1,Soybean_AD1,GetAD.allAD_Buf[148]);
+                    break;
+                case 3:
+                    PID_Calc(&PidControl_DA1,Sorghum_AD1,GetAD.allAD_Buf[148]);
+                    break;
+                default:
+                    PID_Calc(&PidControl_DA1,Corn_AD1,GetAD.allAD_Buf[148]);
+                    break;
+                }
+                /**********************************************************************/
+                //光强调节 DA1
+                dac_data_set(DAC0, DAC_ALIGN_12B_R,(da_out.DA1_OUT=PidControl_DA1.output)); //DAC输出数据设置
+                dac_software_trigger_enable(DAC0);		//DAC软件触发使能
+                //直接取DMA中的中间值，确保调节速度
+                if(((GetAD.allAD_Buf[148]>Corn_DustLowAD1)&&(GetAD.allAD_Buf[148]<=Corn_DustHigAD1)&&Seed_Type!=3)||
+                        ((GetAD.allAD_Buf[148]>Sorghum_DustLowAD1)&&(GetAD.allAD_Buf[148]<=Sorghum_DustHigAD1)&&Seed_Type==3)
+                        ||(Dust_while1.CNT>=5000))
+                {
+                    if((Dust_while1.CNT>=5000))
+                    {
+                        SeedMES.SeedCnt_err&=~0x01; //解除漏种状态
+                        SeedMES.SeedCnt_err|=0x02;  //堵种
+                        break;
+                    }
+                    delay_1ms(5);  //防抖
+                    if(((GetAD.allAD_Buf[148]>Corn_DustLowAD1)&&(GetAD.allAD_Buf[148]<=Corn_DustHigAD1)&&Seed_Type!=3)||
+                            ((GetAD.allAD_Buf[148]>Sorghum_DustLowAD1)&&(GetAD.allAD_Buf[148]<=Sorghum_DustHigAD1)&&Seed_Type==3))
+                    {
+                        break;
+                    }
+                }
+            }
+            Dust_while1.CNT=0;
+            Dust_while1.Flag=false;
+            Dust_compensation.CNT=0;
+            Dust_compensation.Flag=false;
+
+            taskEXIT_CRITICAL();
+
+            Timer2_Init();
+
+            Tim2IT_Flg=0;
+
+//23.12.20   防止堵种后无法清0
+            if((!(SeedMES.SeedCnt_err&0x02))&&(Save_seednum!=SeedMES.SeedNum_Cnt))
+            {
+                SeedMES.SeedNum_Cnt=Save_seednum;
+                Save_seednum=0;
+            }
+        }
+    }
+}
+
+
+#endif
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
