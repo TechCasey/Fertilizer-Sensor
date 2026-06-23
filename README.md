@@ -1,6 +1,6 @@
-# GD32F4-Fertilizer-Sensor
+# Fertilizer-Sensor
 
-**基于GD32F4xx + FreeRTOS的肥料传感器Demo项目**
+**基于GD32F4xx + FreeRTOS传感器Demo项目**
 
 ---
 
